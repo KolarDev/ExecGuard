@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/execguard-cli",
+    "crates/execguard-core",
+    "crates/execguard-parser",
+    "crates/execguard-storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ExecGuard Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-org/execguard"
+
+[workspace.dependencies]
+# Internal crate dependencies
+execguard-core = { path = "crates/execguard-core" }
+execguard-parser = { path = "crates/execguard-parser" }
+execguard-storage = { path = "crates/execguard-storage" }
+
+# Shared external dependencies
+tokio = { version = "1.38", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite"] }
