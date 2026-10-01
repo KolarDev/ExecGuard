@@ -17,6 +17,7 @@ const EXIT_INTERNAL: u8 = 70;
 const USAGE: &str = "\
 usage:
   execguard check [--shell bash|zsh|powershell] [--elevated] [--] \"<command>\"
+  execguard check [--shell ...] [--elevated] --command-from-env
   execguard help";
 
 fn main() -> ExitCode {
@@ -80,6 +81,7 @@ struct CheckArgs {
 fn parse_check_args(args: &[String]) -> Result<CheckArgs, String> {
     let mut shell = Shell::Unknown;
     let mut elevated = false;
+    let mut command_from_env = false;
     let mut iter = args.iter();
 
     while let Some(arg) = iter.next() {
@@ -89,6 +91,7 @@ fn parse_check_args(args: &[String]) -> Result<CheckArgs, String> {
                 shell = Shell::from_name(name).ok_or_else(|| format!("unknown shell '{name}'"))?;
             }
             "--elevated" => elevated = true,
+            "--command-from-env" => command_from_env = true,
             "--" => {
                 let rest: Vec<&str> = iter.by_ref().map(String::as_str).collect();
                 return Ok(CheckArgs { shell, elevated, command: rest.join(" ") });
@@ -97,13 +100,19 @@ fn parse_check_args(args: &[String]) -> Result<CheckArgs, String> {
                 return Err(format!("unknown option '{other}'"));
             }
             _ => {
-                // The first word that isn't an option starts the command.
                 let rest: Vec<&str> = std::iter::once(arg.as_str())
                     .chain(iter.by_ref().map(String::as_str))
                     .collect();
                 return Ok(CheckArgs { shell, elevated, command: rest.join(" ") });
             }
         }
+    }
+
+    if command_from_env {
+        let command = env::var("EXECGUARD_COMMAND").map_err(|_| {
+            "--command-from-env: EXECGUARD_COMMAND is not set or not valid text".to_string()
+        })?;
+        return Ok(CheckArgs { shell, elevated, command });
     }
 
     Err("check: missing command".to_string())
