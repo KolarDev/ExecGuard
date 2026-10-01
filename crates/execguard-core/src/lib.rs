@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::PathBuf;
 
+pub mod rules;
+
 /// The action ExecGuard will take when a command is run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
@@ -162,6 +164,11 @@ pub struct Engine {
 impl Engine {
     pub fn new(rules: Vec<Box<dyn Rule>>) -> Self {
         Engine { rules }
+    }
+
+    /// An engine loaded with every built-in rule.
+    pub fn with_builtin_rules() -> Self {
+        Engine::new(rules::builtin())
     }
 
     /// Evaluate a command against every rule.
