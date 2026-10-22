@@ -61,9 +61,18 @@ Set-PSReadLineKeyHandler -Key Enter -BriefDescription 'ExecGuardAcceptLine' `
         $global:LASTEXITCODE = $savedExitCode
     }
 
-    if ($messages.Count -gt 0) {
-        [Console]::WriteLine()
-        foreach ($message in $messages) { [Console]::WriteLine($message) }
+    # Erase the typed line from the screen and print the messages in its place.
+    # InvokePrompt then draws the prompt and command once, below the messages.
+    $showMessages = {
+        param([string[]] $lines)
+        $readLine::SetCursorPosition(0)
+        $top = [Console]::CursorTop
+        $width = [Console]::BufferWidth
+        $rows = [int][Math]::Max(1, [Math]::Ceiling(([Console]::CursorLeft + $line.Length) / $width))
+        [Console]::SetCursorPosition(0, $top)
+        [Console]::Write(' ' * ($width * $rows - 1))
+        [Console]::SetCursorPosition(0, $top)
+        foreach ($text in $lines) { [Console]::WriteLine($text) }
     }
 
     switch ($code) {
@@ -71,22 +80,29 @@ Set-PSReadLineKeyHandler -Key Enter -BriefDescription 'ExecGuardAcceptLine' `
             $readLine::AcceptLine()
         }
         10 {
+            & $showMessages $messages
             $readLine::InvokePrompt()
             $readLine::AcceptLine()
         }
         20 {
+            & $showMessages $messages
             [Console]::Write('Run it anyway? [y/N] ')
             $key = [Console]::ReadKey($true)
             [Console]::WriteLine($key.KeyChar)
             $readLine::InvokePrompt()
-            if ("$($key.KeyChar)" -eq 'y') { $readLine::AcceptLine() }
+            if ("$($key.KeyChar)" -eq 'y') {
+                $readLine::AcceptLine()
+            } else {
+                $readLine::SetCursorPosition($cursor)
+            }
         }
         30 {
-            [Console]::WriteLine("ExecGuard blocked this command. Edit it, or set `$env:EXECGUARD_DISABLE = '1' to bypass.")
+            & $showMessages ($messages + "ExecGuard blocked this command because it is on your reject list. Edit it, or set `$env:EXECGUARD_DISABLE = '1' to bypass.")
             $readLine::InvokePrompt()
+            $readLine::SetCursorPosition($cursor)
         }
         default {
-            [Console]::WriteLine("ExecGuard failed (exit code $code); running the command UNCHECKED.")
+            & $showMessages ($messages + "ExecGuard failed (exit code $code); running the command UNCHECKED.")
             $readLine::InvokePrompt()
             $readLine::AcceptLine()
         }

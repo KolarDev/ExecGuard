@@ -57,7 +57,7 @@ impl RecursiveDelete {
         if let Some(target) = parsed.targets.iter().find(|t| is_dangerous_target(t, dialect, ctx)) {
             return Some(Finding::new(
                 self.id(),
-                Action::Reject,
+                Action::Confirm,
                 format!("recursive delete of '{target}' would wipe a root or home directory"),
             ));
         }
@@ -255,7 +255,6 @@ fn is_home_path(path: &str, dialect: Dialect, ctx: &Context) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Shell;
     use std::path::PathBuf;
 
     fn ctx() -> Context {
@@ -270,6 +269,24 @@ mod tests {
     fn check(cmd: &str) -> Option<Action> {
         RecursiveDelete.evaluate(cmd, &ctx()).map(|f| f.action)
     }
+
+    fn check_in(cwd: &str, cmd: &str) -> Option<Action> {
+        let mut c = ctx();
+        c.cwd = PathBuf::from(cwd);
+        RecursiveDelete.evaluate(cmd, &c).map(|f| f.action)
+    }
+
+    fn check_ps(cmd: &str) -> Option<Action> {
+        let c = Context {
+            cwd: PathBuf::from(r"C:\Users\Ada\project"),
+            home: Some(PathBuf::from(r"C:\Users\Ada")),
+            shell: Shell::PowerShell,
+            is_elevated: false,
+        };
+        RecursiveDelete.evaluate(cmd, &c).map(|f| f.action)
+    }
+
+    // ---- Unix: flags ----
 
     #[test]
     fn all_flag_spellings_are_caught() {
@@ -304,14 +321,10 @@ mod tests {
         assert_eq!(check("   "), None);
     }
 
-        fn check_in(cwd: &str, cmd: &str) -> Option<Action> {
-        let mut c = ctx();
-        c.cwd = PathBuf::from(cwd);
-        RecursiveDelete.evaluate(cmd, &c).map(|f| f.action)
-    }
+    // ---- Unix: dangerous targets ----
 
     #[test]
-    fn wiping_root_or_home_is_rejected() {
+    fn wiping_root_or_home_needs_confirmation() {
         for cmd in [
             "rm -rf /",
             "rm -rf //",
@@ -324,25 +337,31 @@ mod tests {
             "rm -rf /home/ada",
             "rm -rf -- /",
         ] {
-            assert_eq!(check(cmd), Some(Action::Reject), "not rejected: {cmd}");
+            assert_eq!(check(cmd), Some(Action::Confirm), "not confirmed: {cmd}");
         }
     }
 
     #[test]
-    fn force_is_not_needed_to_reject() {
-        assert_eq!(check("rm -r /"), Some(Action::Reject));
+    fn force_is_not_needed_to_confirm() {
+        assert_eq!(check("rm -r /"), Some(Action::Confirm));
     }
 
     #[test]
     fn one_dangerous_target_is_enough() {
-        assert_eq!(check("rm -rf build ~ dist"), Some(Action::Reject));
+        assert_eq!(check("rm -rf build ~ dist"), Some(Action::Confirm));
     }
 
     #[test]
     fn star_depends_on_where_you_are() {
         assert_eq!(check_in("/home/ada/project/build", "rm -rf *"), Some(Action::Warn));
-        assert_eq!(check_in("/home/ada", "rm -rf *"), Some(Action::Reject));
-        assert_eq!(check_in("/", "rm -rf ."), Some(Action::Reject));
+        assert_eq!(check_in("/home/ada", "rm -rf *"), Some(Action::Confirm));
+        assert_eq!(check_in("/", "rm -rf ."), Some(Action::Confirm));
+    }
+
+    #[test]
+    fn deleting_the_parent_of_a_project_needs_confirmation() {
+        assert_eq!(check_in("/home/ada/project", "rm -rf .."), Some(Action::Confirm));
+        assert_eq!(check_in("/home/ada/project/build", "rm -rf .."), Some(Action::Warn));
     }
 
     #[test]
@@ -351,11 +370,13 @@ mod tests {
         assert_eq!(check("rm -rf /home/ada/project"), Some(Action::Warn));
     }
 
-    /// The `sudo` prefix is treated as a flag that makes the command more dangerous.
+    // ---- Unix: program paths and privilege ----
+
     #[test]
     fn program_paths_are_recognised() {
         assert_eq!(check("/bin/rm -rf build"), Some(Action::Warn));
         assert_eq!(check("/usr/bin/rm -rf build"), Some(Action::Warn));
+        assert_eq!(check("\\rm -rf build"), Some(Action::Warn));
     }
 
     #[test]
@@ -375,9 +396,10 @@ mod tests {
     }
 
     #[test]
-    fn dangerous_targets_are_still_rejected_under_sudo() {
-        assert_eq!(check("sudo rm -rf /"), Some(Action::Reject));
-        assert_eq!(check("sudo rm -r ~"), Some(Action::Reject));
+    fn dangerous_targets_under_sudo_show_the_danger_message() {
+        let finding = RecursiveDelete.evaluate("sudo rm -rf /", &ctx()).expect("should object");
+        assert_eq!(finding.action, Action::Confirm);
+        assert!(finding.message.contains("would wipe"), "wrong message: {}", finding.message);
     }
 
     #[test]
@@ -387,16 +409,7 @@ mod tests {
         assert_eq!(check("sudo rm notes.txt"), None);
     }
 
-    /// PowerShell is case-insensitive and allows `\` or `/` in paths.
-        fn check_ps(cmd: &str) -> Option<Action> {
-        let c = Context {
-            cwd: PathBuf::from(r"C:\Users\Ada\project"),
-            home: Some(PathBuf::from(r"C:\Users\Ada")),
-            shell: Shell::PowerShell,
-            is_elevated: false,
-        };
-        RecursiveDelete.evaluate(cmd, &c).map(|f| f.action)
-    }
+    // ---- PowerShell ----
 
     #[test]
     fn powershell_spellings_are_caught() {
@@ -413,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn powershell_dangerous_targets_are_rejected() {
+    fn powershell_dangerous_targets_need_confirmation() {
         for cmd in [
             r"Remove-Item -Recurse -Force C:\",
             r"Remove-Item -Recurse C:\*",
@@ -424,7 +437,7 @@ mod tests {
             r"Remove-Item -Recurse -Force C:\Users\Ada",
             r"Remove-Item -Recurse -Force c:\users\ada\",
         ] {
-            assert_eq!(check_ps(cmd), Some(Action::Reject), "not rejected: {cmd}");
+            assert_eq!(check_ps(cmd), Some(Action::Confirm), "not confirmed: {cmd}");
         }
     }
 
@@ -447,5 +460,18 @@ mod tests {
     #[test]
     fn unix_shells_do_not_know_powershell_names() {
         assert_eq!(check("Remove-Item -Recurse -Force build"), None);
+    }
+
+    // ---- The promise: built-in rules never reject ----
+
+    #[test]
+    fn built_in_rules_never_reject() {
+        let engine = crate::Engine::with_builtin_rules();
+        let mut c = ctx();
+        c.is_elevated = true;
+        for cmd in ["rm -rf /", "rm -rf ~", "sudo rm -rf /*", "rm -rf $HOME", "rm -rf .."] {
+            let action = engine.evaluate(cmd, &c).action();
+            assert_ne!(action, Action::Reject, "built-in rules rejected: {cmd}");
+        }
     }
 }
