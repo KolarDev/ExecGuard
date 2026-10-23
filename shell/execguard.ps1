@@ -28,6 +28,60 @@ $global:ExecGuardElevated = if ($IsWindows -or $PSVersionTable.PSEdition -eq 'De
     (id -u) -eq '0'
 }
 
+# Set by the Enter key handler just before it lets a line run; read and
+# cleared by `prompt` once that line has finished, to log it to history.
+$global:ExecGuardPendingCommand = $null
+$global:ExecGuardPendingOutcome = $null
+$global:ExecGuardPendingStarted = $null
+
+function global:ExecGuardWillRun([string]$command, [string]$outcome) {
+    $global:ExecGuardPendingCommand = $command
+    $global:ExecGuardPendingOutcome = $outcome
+    $global:ExecGuardPendingStarted = Get-Date
+}
+
+# `prompt` runs after every command, the same role Bash's PROMPT_COMMAND
+# plays -- it's where we finally know the real exit code and duration.
+# Whatever `prompt` was already defined (a custom profile, oh-my-posh, ...)
+# is kept and called afterwards, so we don't clobber it.
+$global:ExecGuardPreviousPrompt = if (Test-Path Function:\prompt) {
+    Get-Content Function:\prompt
+} else {
+    { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " }
+}
+
+function global:prompt {
+    # Captured first, before anything else here can overwrite them.
+    $execguardExitCode = $LASTEXITCODE
+    $execguardSucceeded = $?
+
+    if ($global:ExecGuardPendingCommand) {
+        $resolvedExitCode = if ($null -ne $execguardExitCode -and $execguardExitCode -ne 0) {
+            $execguardExitCode
+        } elseif ($execguardSucceeded) {
+            0
+        } else {
+            1
+        }
+        $durationMs = [int]((Get-Date) - $global:ExecGuardPendingStarted).TotalMilliseconds
+
+        try {
+            $env:EXECGUARD_COMMAND = $global:ExecGuardPendingCommand
+            & $global:ExecGuardExe record --shell powershell --cwd (Get-Location).Path `
+                --exit-code $resolvedExitCode --duration-ms $durationMs `
+                --outcome $global:ExecGuardPendingOutcome --command-from-env 2>&1 | Out-Null
+        } catch {
+            # Logging history must never break the prompt.
+        } finally {
+            Remove-Item Env:EXECGUARD_COMMAND -ErrorAction SilentlyContinue
+        }
+
+        $global:ExecGuardPendingCommand = $null
+    }
+
+    & $global:ExecGuardPreviousPrompt
+}
+
 Set-PSReadLineKeyHandler -Key Enter -BriefDescription 'ExecGuardAcceptLine' `
     -Description 'Check the command with ExecGuard before running it' -ScriptBlock {
 
@@ -77,11 +131,13 @@ Set-PSReadLineKeyHandler -Key Enter -BriefDescription 'ExecGuardAcceptLine' `
 
     switch ($code) {
         0 {
+            ExecGuardWillRun $line 'ALLOW'
             $readLine::AcceptLine()
         }
         10 {
             & $showMessages $messages
             $readLine::InvokePrompt()
+            ExecGuardWillRun $line 'WARN'
             $readLine::AcceptLine()
         }
         20 {
@@ -91,6 +147,7 @@ Set-PSReadLineKeyHandler -Key Enter -BriefDescription 'ExecGuardAcceptLine' `
             [Console]::WriteLine($key.KeyChar)
             $readLine::InvokePrompt()
             if ("$($key.KeyChar)" -eq 'y') {
+                ExecGuardWillRun $line 'CONFIRM'
                 $readLine::AcceptLine()
             } else {
                 $readLine::SetCursorPosition($cursor)
@@ -104,6 +161,7 @@ Set-PSReadLineKeyHandler -Key Enter -BriefDescription 'ExecGuardAcceptLine' `
         default {
             & $showMessages ($messages + "ExecGuard failed (exit code $code); running the command UNCHECKED.")
             $readLine::InvokePrompt()
+            ExecGuardWillRun $line 'UNCHECKED'
             $readLine::AcceptLine()
         }
     }

@@ -6,9 +6,5 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-sqlx.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
+rusqlite.workspace = true
+regex.workspace = true

@@ -21,19 +21,52 @@ fi
 _execguard_ready=0      # 1 = the next command is the first of a newly typed line
 _execguard_cancel=0     # 1 = skip everything left on the current line
 _execguard_last_hist=
+_execguard_last_exit=0  # exit status of the command that just finished
+
+# Set by _execguard_debug just before it lets a line run; read and cleared
+# by _execguard_prompt once that line has finished, to log it to history.
+_execguard_pending_command=
+_execguard_pending_outcome=
+_execguard_pending_started_ms=
 
 _execguard_say() {
   [[ -n $1 ]] && printf '%s\n' "$1" >&2
 }
 
-# Runs FIRST at every prompt: clear the flags before anything else runs.
+# Milliseconds since the Unix epoch. Prefers the shell builtin (Bash 5+,
+# no extra process); falls back to the `date` command on older Bash.
+_execguard_now_ms() {
+  if [[ -n ${EPOCHREALTIME:-} ]]; then
+    local whole=${EPOCHREALTIME%.*}
+    local frac=${EPOCHREALTIME#*.}
+    # `10#` forces base-10, so a fractional part like "012345" isn't
+    # misread as an (invalid) octal number.
+    printf '%d' $(( whole * 1000 + 10#${frac:0:3} ))
+  else
+    date +%s%3N
+  fi
+}
+
+# Runs FIRST at every prompt, before anything else: capture the exit status
+# of the command that just finished, then clear the flags for the next one.
 _execguard_reset() {
+  _execguard_last_exit=$?
   _execguard_cancel=0
   _execguard_ready=0
 }
 
-# Runs LAST at every prompt: get ready for the next typed line.
+# Runs LAST at every prompt: log the line that just ran (if any), then get
+# ready for the next typed line.
 _execguard_prompt() {
+  if [[ -n $_execguard_pending_command ]]; then
+    local duration=$(( $(_execguard_now_ms) - _execguard_pending_started_ms ))
+    "$EXECGUARD_BIN" record --shell bash --cwd "$PWD" \
+      --exit-code "$_execguard_last_exit" --duration-ms "$duration" \
+      --outcome "$_execguard_pending_outcome" -- "$_execguard_pending_command" \
+      >/dev/null 2>&1
+    _execguard_pending_command=
+  fi
+
   _execguard_last_hist=$(HISTTIMEFORMAT= builtin history 1)
   _execguard_ready=1
 }
@@ -75,16 +108,21 @@ _execguard_debug() {
 
   case $code in
     0)
+      _execguard_will_run "$line" ALLOW
       return 0 ;;
     10)
       _execguard_say "$messages"
+      _execguard_will_run "$line" WARN
       return 0 ;;
     20)
       _execguard_say "$messages"
       local reply
       read -r -n 1 -p 'Run it anyway? [y/N] ' reply </dev/tty
       echo >&2
-      [[ $reply == [yY] ]] && return 0
+      if [[ $reply == [yY] ]]; then
+        _execguard_will_run "$line" CONFIRM
+        return 0
+      fi
       _execguard_say 'Not run. Press Up to get the command back.'
       _execguard_cancel=1
       return 1 ;;
@@ -96,8 +134,17 @@ _execguard_debug() {
     *)
       _execguard_say "$messages"
       _execguard_say "ExecGuard failed (exit code $code); running the command UNCHECKED."
+      _execguard_will_run "$line" UNCHECKED
       return 0 ;;
   esac
+}
+
+# Records that a line is about to run, so _execguard_prompt can log it to
+# history once it finishes and the real exit code/duration are known.
+_execguard_will_run() {
+  _execguard_pending_command=$1
+  _execguard_pending_outcome=$2
+  _execguard_pending_started_ms=$(_execguard_now_ms)
 }
 
 shopt -s extdebug
