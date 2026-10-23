@@ -1,14 +1,8 @@
-//! Built-in safety rules.
+//! Catches recursive deletes in Unix shells and PowerShell.
 
+use super::targets::{is_dangerous_target, Dialect};
 use crate::{Action, Context, Finding, Rule, Shell, SimpleCommand};
-use std::path::Path;
 
-/// Every built-in rule, ready to hand to the engine.
-pub fn builtin() -> Vec<Box<dyn Rule>> {
-    vec![Box::new(RecursiveDelete)]
-}
-
-/// Catches recursive deletes in Unix shells and PowerShell.
 pub struct RecursiveDelete;
 
 impl Rule for RecursiveDelete {
@@ -69,13 +63,6 @@ impl RecursiveDelete {
 
         None
     }
-}
-
-/// Which command-line language a delete command is written in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Dialect {
-    Unix,
-    PowerShell,
 }
 
 /// Every dialect a program name could mean in this shell.
@@ -182,63 +169,6 @@ fn parse_powershell_args<'a>(args: &[&'a str]) -> RmArgs<'a> {
 
     parsed
 }
-
-/// Is this target a filesystem root or the user's home directory?
-/// `target` has already had its quotes removed by the parser.
-fn is_dangerous_target(target: &str, dialect: Dialect, ctx: &Context) -> bool {
-    // PowerShell paths are case-insensitive and accept `\` or `/`.
-    // Convert them to one canonical form so a single table covers every spelling.
-    let normalized = match dialect {
-        Dialect::Unix => target.to_string(),
-        Dialect::PowerShell => target.to_ascii_lowercase().replace('\\', "/"),
-    };
-    let path = normalized.trim_end_matches('/');
-
-    match path {
-        // `/` and `//` become "" once trailing slashes are trimmed.
-        "" | "/*" | "~" | "~/*" => true,
-        "$HOME" | "${HOME}" | "$HOME/*" | "${HOME}/*" => dialect == Dialect::Unix,
-        "$home" | "$home/*" | "$env:userprofile" | "$env:userprofile/*" => dialect == Dialect::PowerShell,
-
-        // Relative targets: harmless in a project folder, fatal in ~ or /.
-        "*" | "." | "./*" => ctx.cwd_is_root() || ctx.cwd_is_home(),
-        ".." => match ctx.cwd.parent() {
-            None => true,
-            Some(parent) => parent.parent().is_none() || ctx.home.as_deref() == Some(parent),
-        },
-
-        _ if dialect == Dialect::PowerShell && is_drive_root(path) => true,
-        _ => is_home_path(path, dialect, ctx),
-    }
-}
-
-/// `c:` or `c:/*` (already normalized): the root of a Windows drive.
-fn is_drive_root(path: &str) -> bool {
-    let path = path.strip_suffix("/*").unwrap_or(path);
-    let bytes = path.as_bytes();
-    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
-}
-
-/// An absolute path that happens to be the home directory.
-fn is_home_path(path: &str, dialect: Dialect, ctx: &Context) -> bool {
-    let Some(home) = ctx.home.as_deref() else {
-        return false;
-    };
-
-    match dialect {
-        Dialect::Unix => Path::new(path) == home,
-        Dialect::PowerShell => {
-            let home = home.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
-            path == home.trim_end_matches('/')
-        }
-    }
-}
-
-
-     
-
-
-
 
 #[cfg(test)]
 mod tests {
