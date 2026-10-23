@@ -6,6 +6,3 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-serde.workspace = true
-thiserror.workspace = true
-tracing.workspace = true

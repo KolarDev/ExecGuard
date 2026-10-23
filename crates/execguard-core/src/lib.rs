@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 pub mod rules;
 
+pub use execguard_parser::SimpleCommand;
+
 /// The action ExecGuard will take when a command is run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
@@ -144,7 +146,8 @@ impl Decision {
 }
 
 
-/// A safety rule: looks at a command and its context, and may object.
+/// A safety rule: looks at one already-parsed command and its context, and
+/// may object.
 ///
 /// Returning `None` means "no opinion": as far as this rule is
 /// concerned, the command is fine.
@@ -153,7 +156,7 @@ pub trait Rule: Send + Sync {
     fn id(&self) -> &'static str;
 
     /// Examine a command. Return a `Finding` only if this rule objects.
-    fn evaluate(&self, command: &str, ctx: &Context) -> Option<Finding>;
+    fn evaluate(&self, command: &SimpleCommand, ctx: &Context) -> Option<Finding>;
 }
 
 /// An engine that runs rules against commands and combines their findings.
@@ -171,13 +174,26 @@ impl Engine {
         Engine::new(rules::builtin())
     }
 
-    /// Evaluate a command against every rule.
+    /// Evaluate a whole typed command line against every rule.
+    ///
+    /// The line is split into its simple commands first (so `cd ~ && rm -rf
+    /// *` is judged as two commands, not one), and every rule sees every one
+    /// of them.
     pub fn evaluate(&self, command: &str, ctx: &Context) -> Decision {
-        let findings = self
-            .rules
-            .iter()
-            .filter_map(|rule| rule.evaluate(command, ctx))
-            .collect();
+        let syntax = match ctx.shell {
+            Shell::PowerShell => execguard_parser::Syntax::PowerShell,
+            _ => execguard_parser::Syntax::Posix,
+        };
+
+        let mut findings = Vec::new();
+        for simple_command in execguard_parser::parse(command, syntax) {
+            for rule in &self.rules {
+                if let Some(finding) = rule.evaluate(&simple_command, ctx) {
+                    findings.push(finding);
+                }
+            }
+        }
+
         Decision::from_findings(findings)
     }
 }
@@ -314,6 +330,15 @@ mod tests {
         assert_eq!(f.to_string(), "[WARN] forced recursive delete (fs.recursive-delete)");
     }
 
+    /// Parses `text` as a Bash/Zsh line and returns its first simple command.
+    /// A helper for tests that call a `Rule` directly, bypassing `Engine`.
+    fn simple(text: &str) -> SimpleCommand {
+        execguard_parser::parse(text, execguard_parser::Syntax::Posix)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+
     /// A simple rule for testing the Rule trait.
     struct DropDatabase;
 
@@ -322,8 +347,9 @@ mod tests {
             "test.drop-database"
         }
 
-        fn evaluate(&self, command: &str, _ctx: &Context) -> Option<Finding> {
-            if command.to_ascii_uppercase().contains("DROP DATABASE") {
+        fn evaluate(&self, command: &SimpleCommand, _ctx: &Context) -> Option<Finding> {
+            let text = format!("{} {}", command.program, command.args.join(" ")).to_ascii_uppercase();
+            if text.contains("DROP DATABASE") {
                 Some(Finding::new(self.id(), Action::Reject, "dropping a database"))
             } else {
                 None
@@ -333,7 +359,7 @@ mod tests {
 
     #[test]
     fn a_rule_objects_to_matching_commands() {
-        let finding = DropDatabase.evaluate("psql -c 'drop database prod'", &ctx_in("/home/ada"));
+        let finding = DropDatabase.evaluate(&simple("psql -c 'drop database prod'"), &ctx_in("/home/ada"));
         let finding = finding.expect("rule should have objected");
         assert_eq!(finding.action, Action::Reject);
         assert_eq!(finding.rule_id, "test.drop-database");
@@ -341,7 +367,7 @@ mod tests {
 
     #[test]
     fn a_rule_ignores_other_commands() {
-        assert_eq!(DropDatabase.evaluate("ls -la", &ctx_in("/home/ada")), None);
+        assert_eq!(DropDatabase.evaluate(&simple("ls -la"), &ctx_in("/home/ada")), None);
     }
 
     /// A simple engine for testing the Engine struct.
@@ -352,7 +378,7 @@ mod tests {
             "test.elevated"
         }
 
-        fn evaluate(&self, _command: &str, ctx: &Context) -> Option<Finding> {
+        fn evaluate(&self, _command: &SimpleCommand, ctx: &Context) -> Option<Finding> {
             if ctx.is_elevated {
                 Some(Finding::new(self.id(), Action::Confirm, "running with elevated privileges"))
             } else {

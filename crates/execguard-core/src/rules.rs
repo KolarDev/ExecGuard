@@ -1,6 +1,6 @@
 //! Built-in safety rules.
 
-use crate::{Action, Context, Finding, Rule, Shell};
+use crate::{Action, Context, Finding, Rule, Shell, SimpleCommand};
 use std::path::Path;
 
 /// Every built-in rule, ready to hand to the engine.
@@ -16,26 +16,15 @@ impl Rule for RecursiveDelete {
         "fs.recursive-delete"
     }
 
-    fn evaluate(&self, command: &str, ctx: &Context) -> Option<Finding> {
-        let mut tokens = command.split_whitespace().peekable();
-
-        // `sudo rm ...`: skip the prefix, but remember that it means root.
-        let mut elevated = ctx.is_elevated;
-        while let Some(&word) = tokens.peek() {
-            if word == "sudo" || word == "doas" {
-                elevated = true;
-                tokens.next();
-            } else {
-                break;
-            }
-        }
-
-        let program = tokens.next()?;
-        let args: Vec<&str> = tokens.collect();
+    fn evaluate(&self, command: &SimpleCommand, ctx: &Context) -> Option<Finding> {
+        // `sudo`/`doas` are already stripped from `command` by the parser;
+        // it just tells us they were there.
+        let elevated = ctx.is_elevated || command.elevated;
+        let args: Vec<&str> = command.args.iter().map(String::as_str).collect();
 
         // Judge the command under every meaning it could have,
         // and keep the most severe verdict.
-        dialects_for(program, ctx.shell)
+        dialects_for(&command.program, ctx.shell)
             .iter()
             .filter_map(|&dialect| self.judge(dialect, &args, elevated, ctx))
             .max_by_key(|finding| finding.action)
@@ -195,14 +184,13 @@ fn parse_powershell_args<'a>(args: &[&'a str]) -> RmArgs<'a> {
 }
 
 /// Is this target a filesystem root or the user's home directory?
+/// `target` has already had its quotes removed by the parser.
 fn is_dangerous_target(target: &str, dialect: Dialect, ctx: &Context) -> bool {
-    let unquoted = target.trim_matches(|c| c == '"' || c == '\'');
-
     // PowerShell paths are case-insensitive and accept `\` or `/`.
     // Convert them to one canonical form so a single table covers every spelling.
     let normalized = match dialect {
-        Dialect::Unix => unquoted.to_string(),
-        Dialect::PowerShell => unquoted.to_ascii_lowercase().replace('\\', "/"),
+        Dialect::Unix => target.to_string(),
+        Dialect::PowerShell => target.to_ascii_lowercase().replace('\\', "/"),
     };
     let path = normalized.trim_end_matches('/');
 
@@ -266,14 +254,25 @@ mod tests {
         }
     }
 
+    /// Parses `cmd` as the given shell would and returns its first simple
+    /// command, the way `Engine` does internally. Tests use this to call
+    /// `RecursiveDelete` directly without going through `Engine`.
+    fn parse_first(cmd: &str, shell: Shell) -> SimpleCommand {
+        let syntax = match shell {
+            Shell::PowerShell => execguard_parser::Syntax::PowerShell,
+            _ => execguard_parser::Syntax::Posix,
+        };
+        execguard_parser::parse(cmd, syntax).into_iter().next().unwrap_or_default()
+    }
+
     fn check(cmd: &str) -> Option<Action> {
-        RecursiveDelete.evaluate(cmd, &ctx()).map(|f| f.action)
+        RecursiveDelete.evaluate(&parse_first(cmd, Shell::Bash), &ctx()).map(|f| f.action)
     }
 
     fn check_in(cwd: &str, cmd: &str) -> Option<Action> {
         let mut c = ctx();
         c.cwd = PathBuf::from(cwd);
-        RecursiveDelete.evaluate(cmd, &c).map(|f| f.action)
+        RecursiveDelete.evaluate(&parse_first(cmd, Shell::Bash), &c).map(|f| f.action)
     }
 
     fn check_ps(cmd: &str) -> Option<Action> {
@@ -283,7 +282,7 @@ mod tests {
             shell: Shell::PowerShell,
             is_elevated: false,
         };
-        RecursiveDelete.evaluate(cmd, &c).map(|f| f.action)
+        RecursiveDelete.evaluate(&parse_first(cmd, Shell::PowerShell), &c).map(|f| f.action)
     }
 
     // ---- Unix: flags ----
@@ -391,13 +390,17 @@ mod tests {
     fn root_shell_escalates_to_confirm() {
         let mut c = ctx();
         c.is_elevated = true;
-        let action = RecursiveDelete.evaluate("rm -r build", &c).map(|f| f.action);
+        let action = RecursiveDelete
+            .evaluate(&parse_first("rm -r build", Shell::Bash), &c)
+            .map(|f| f.action);
         assert_eq!(action, Some(Action::Confirm));
     }
 
     #[test]
     fn dangerous_targets_under_sudo_show_the_danger_message() {
-        let finding = RecursiveDelete.evaluate("sudo rm -rf /", &ctx()).expect("should object");
+        let finding = RecursiveDelete
+            .evaluate(&parse_first("sudo rm -rf /", Shell::Bash), &ctx())
+            .expect("should object");
         assert_eq!(finding.action, Action::Confirm);
         assert!(finding.message.contains("would wipe"), "wrong message: {}", finding.message);
     }
@@ -460,6 +463,33 @@ mod tests {
     #[test]
     fn unix_shells_do_not_know_powershell_names() {
         assert_eq!(check("Remove-Item -Recurse -Force build"), None);
+    }
+
+    // ---- Gaps fixed by the real parser (dev-doc/HANDOFF.md 6.4) ----
+
+    #[test]
+    fn a_quoted_target_with_spaces_is_one_argument_not_two() {
+        // Before the parser, "my folder" split on whitespace into two
+        // separate targets, "my" and "folder" -- neither a real path.
+        assert_eq!(check(r#"rm -rf "my folder""#), Some(Action::Warn));
+    }
+
+    #[test]
+    fn a_chained_command_is_still_checked() {
+        // Before the parser, only the first word of the whole line ("cd")
+        // was ever looked at, so this rm was invisible.
+        let engine = crate::Engine::with_builtin_rules();
+        let mut c = ctx();
+        c.cwd = PathBuf::from("/home/ada");
+        let action = engine.evaluate("cd ~ && rm -rf *", &c).action();
+        assert_eq!(action, Action::Confirm);
+    }
+
+    #[test]
+    fn wrapper_commands_no_longer_hide_the_real_program() {
+        for cmd in ["env rm -rf build", "nohup rm -rf build", "command rm -rf build"] {
+            assert_eq!(check(cmd), Some(Action::Warn), "missed: {cmd}");
+        }
     }
 
     // ---- The promise: built-in rules never reject ----

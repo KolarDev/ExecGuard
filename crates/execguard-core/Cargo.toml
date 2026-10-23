@@ -7,10 +7,3 @@ license.workspace = true
 
 [dependencies]
 execguard-parser.workspace = true
-execguard-storage.workspace = true
-
-tokio.workspace = true
-serde.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-anyhow.workspace = true
