@@ -6,7 +6,7 @@
 
 use std::env;
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use execguard_core::{Context, Engine, Shell};
@@ -21,7 +21,11 @@ usage:
   execguard record --shell <s> --cwd <path> --exit-code <n> --duration-ms <n>
                     --outcome ALLOW|WARN|CONFIRM|REJECT [--] \"<command>\"
   execguard record [...] --command-from-env
+  execguard history [--limit <n>] [--here]
+  execguard search <term> [--limit <n>] [--here]
   execguard help";
+
+const DEFAULT_HISTORY_LIMIT: i64 = 20;
 
 fn main() -> ExitCode {
     let outcome = panic::catch_unwind(|| run(env::args().skip(1).collect()));
@@ -47,6 +51,8 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
     match subcommand.as_str() {
         "check" => check(rest),
         "record" => record(rest),
+        "history" => history(rest),
+        "search" => search(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             Ok(ExitCode::SUCCESS)
@@ -204,6 +210,104 @@ fn parse_outcome(value: &str) -> Result<String, String> {
     }
 }
 
+/// Shows the most recent recorded commands, newest first.
+fn history(args: &[String]) -> Result<ExitCode, String> {
+    run_history_query(parse_history_opts(args, false)?)
+}
+
+/// Like `history`, but only commands whose (redacted) text contains `term`.
+fn search(args: &[String]) -> Result<ExitCode, String> {
+    run_history_query(parse_history_opts(args, true)?)
+}
+
+struct HistoryOpts {
+    term: Option<String>,
+    limit: i64,
+    /// Only this Git repository's history, i.e. the one the current
+    /// directory is inside.
+    here: bool,
+}
+
+fn parse_history_opts(args: &[String], require_term: bool) -> Result<HistoryOpts, String> {
+    let mut term = None;
+    let mut limit = DEFAULT_HISTORY_LIMIT;
+    let mut here = false;
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--limit" => {
+                let value = iter.next().ok_or("--limit needs a value")?;
+                limit = value.parse::<i64>().map_err(|_| format!("--limit: '{value}' is not a number"))?;
+            }
+            "--here" => here = true,
+            other if other.starts_with("--") => return Err(format!("unknown option '{other}'")),
+            other if term.is_none() => term = Some(other.to_string()),
+            other => return Err(format!("unexpected extra argument '{other}'")),
+        }
+    }
+
+    if require_term && term.is_none() {
+        return Err("search: missing search term".to_string());
+    }
+
+    Ok(HistoryOpts { term, limit, here })
+}
+
+fn run_history_query(opts: HistoryOpts) -> Result<ExitCode, String> {
+    let path = execguard_storage::Store::default_path().map_err(|e| e.to_string())?;
+    let store = execguard_storage::Store::open(&path).map_err(|e| e.to_string())?;
+
+    let project_root = if opts.here {
+        let cwd = env::current_dir().map_err(|e| e.to_string())?;
+        let root = execguard_storage::find_git_root(&cwd)
+            .ok_or_else(|| "--here: the current directory is not inside a Git repository".to_string())?;
+        Some(root)
+    } else {
+        None
+    };
+
+    let entries = store
+        .query(execguard_storage::Query {
+            term: opts.term.as_deref(),
+            project_root: project_root.as_deref(),
+            limit: opts.limit,
+        })
+        .map_err(|e| e.to_string())?;
+
+    print_history(&entries);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_history(entries: &[execguard_storage::HistoryEntry]) {
+    if entries.is_empty() {
+        println!("(no matching history)");
+        return;
+    }
+
+    for entry in entries {
+        let when = format_local_time(entry.ran_at_ms);
+        let project = entry.project_root.as_deref().map(project_name).unwrap_or("-");
+        println!(
+            "{when}  {:<8} exit {:<4} {:>6}ms  [{project}]  {}",
+            entry.outcome, entry.exit_code, entry.duration_ms, entry.command
+        );
+    }
+}
+
+/// The last path component of a Git root, e.g. `/home/ada/execguard` -> `execguard`.
+fn project_name(root: &str) -> &str {
+    Path::new(root).file_name().and_then(|name| name.to_str()).unwrap_or(root)
+}
+
+fn format_local_time(epoch_ms: i64) -> String {
+    use chrono::{Local, LocalResult, TimeZone};
+    match Local.timestamp_millis_opt(epoch_ms) {
+        LocalResult::Single(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        _ => "?".to_string(),
+    }
+}
+
 struct CheckArgs {
     shell: Shell,
     elevated: bool,
@@ -346,5 +450,39 @@ mod tests {
         let i = bad.iter().position(|a| a == "0").unwrap();
         bad[i] = "soon".to_string();
         assert!(parse_record_args(&bad).is_err());
+    }
+
+    #[test]
+    fn history_defaults_need_no_flags() {
+        let opts = parse_history_opts(&args(&[]), false).unwrap();
+        assert_eq!(opts.term, None);
+        assert_eq!(opts.limit, DEFAULT_HISTORY_LIMIT);
+        assert!(!opts.here);
+    }
+
+    #[test]
+    fn search_requires_a_term() {
+        assert!(parse_history_opts(&args(&[]), true).is_err());
+        let opts = parse_history_opts(&args(&["rm"]), true).unwrap();
+        assert_eq!(opts.term, Some("rm".to_string()));
+    }
+
+    #[test]
+    fn history_reads_limit_and_here() {
+        let opts = parse_history_opts(&args(&["--limit", "5", "--here"]), false).unwrap();
+        assert_eq!(opts.limit, 5);
+        assert!(opts.here);
+    }
+
+    #[test]
+    fn a_second_positional_argument_is_an_error() {
+        assert!(parse_history_opts(&args(&["rm", "push"]), true).is_err());
+    }
+
+    #[test]
+    fn unknown_option_or_bad_limit_is_an_error() {
+        assert!(parse_history_opts(&args(&["--verbose"]), false).is_err());
+        assert!(parse_history_opts(&args(&["--limit", "soon"]), false).is_err());
+        assert!(parse_history_opts(&args(&["--limit"]), false).is_err());
     }
 }

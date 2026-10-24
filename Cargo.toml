@@ -32,3 +32,4 @@ clap = { version = "4.5", features = ["derive", "env"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 regex = "1.10"
+chrono = "0.4"

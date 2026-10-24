@@ -29,14 +29,16 @@ CREATE TABLE IF NOT EXISTS commands (
 );
 
 CREATE TABLE IF NOT EXISTS executions (
-    id          INTEGER PRIMARY KEY,
-    command_id  INTEGER NOT NULL REFERENCES commands(id),
-    cwd         TEXT NOT NULL,
-    shell       TEXT NOT NULL,
-    ran_at      INTEGER NOT NULL,
-    exit_code   INTEGER NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    outcome     TEXT NOT NULL
+    id           INTEGER PRIMARY KEY,
+    command_id   INTEGER NOT NULL REFERENCES commands(id),
+    cwd          TEXT NOT NULL,
+    shell        TEXT NOT NULL,
+    ran_at       INTEGER NOT NULL,
+    exit_code    INTEGER NOT NULL,
+    duration_ms  INTEGER NOT NULL,
+    outcome      TEXT NOT NULL,
+    -- The Git repository containing `cwd`, if any; NULL outside one.
+    project_root TEXT
 );
 ";
 
@@ -90,10 +92,11 @@ impl Store {
     pub fn record(&self, execution: NewExecution) -> Result<(), StorageError> {
         let text = normalize(&redact::redact(execution.command));
         let command_id = self.upsert_command(&text)?;
+        let project_root = find_git_root(Path::new(execution.cwd));
 
         self.conn.execute(
-            "INSERT INTO executions (command_id, cwd, shell, ran_at, exit_code, duration_ms, outcome)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO executions (command_id, cwd, shell, ran_at, exit_code, duration_ms, outcome, project_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 command_id,
                 execution.cwd,
@@ -102,10 +105,55 @@ impl Store {
                 execution.exit_code,
                 execution.duration_ms,
                 execution.outcome,
+                project_root,
             ],
         )?;
 
         Ok(())
+    }
+
+    /// Runs a history lookup: the most recent executions, optionally
+    /// narrowed to ones whose (redacted) text matches `query.term` and/or
+    /// whose project is `query.project_root`.
+    pub fn query(&self, query: Query) -> Result<Vec<HistoryEntry>, StorageError> {
+        let mut sql = String::from(
+            "SELECT c.text, e.cwd, e.shell, e.ran_at, e.exit_code, e.duration_ms, e.outcome, e.project_root
+             FROM executions e JOIN commands c ON c.id = e.command_id
+             WHERE 1 = 1", // a hook so every real filter below can just start with "AND"
+        );
+        if query.term.is_some() {
+            sql.push_str(" AND c.text LIKE :term");
+        }
+        if query.project_root.is_some() {
+            sql.push_str(" AND e.project_root = :project_root");
+        }
+        sql.push_str(" ORDER BY e.ran_at DESC LIMIT :limit");
+
+        let pattern = query.term.map(|term| format!("%{term}%"));
+        let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+        if let Some(pattern) = &pattern {
+            params.push((":term", pattern));
+        }
+        if let Some(project_root) = &query.project_root {
+            params.push((":project_root", project_root));
+        }
+        params.push((":limit", &query.limit));
+
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(params.as_slice(), |row| {
+            Ok(HistoryEntry {
+                command: row.get(0)?,
+                cwd: row.get(1)?,
+                shell: row.get(2)?,
+                ran_at_ms: row.get(3)?,
+                exit_code: row.get(4)?,
+                duration_ms: row.get(5)?,
+                outcome: row.get(6)?,
+                project_root: row.get(7)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(StorageError::from)
     }
 
     /// Finds the `commands` row for `text`, creating it if this is the
@@ -120,6 +168,63 @@ impl Store {
 
         let id = self.conn.query_row("SELECT id FROM commands WHERE text = ?1", params![text], |row| row.get(0))?;
         Ok(id)
+    }
+}
+
+/// What to look for in [`Store::query`]. Every field is optional except
+/// `limit`: leaving `term`/`project_root` as `None` just means "don't
+/// filter on that."
+pub struct Query<'a> {
+    /// Matched as a substring against the stored (redacted) command text.
+    pub term: Option<&'a str>,
+    /// Matched exactly against the Git repository root an execution was
+    /// recorded under (see [`find_git_root`]).
+    pub project_root: Option<&'a str>,
+    pub limit: i64,
+}
+
+/// One row of history: a command that ran, and what happened when it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub command: String,
+    pub cwd: String,
+    pub shell: String,
+    pub ran_at_ms: i64,
+    pub exit_code: i32,
+    pub duration_ms: i64,
+    pub outcome: String,
+    pub project_root: Option<String>,
+}
+
+/// Walks up from `dir` looking for a `.git` entry -- a directory for an
+/// ordinary clone, or a file for a submodule/worktree (which points at the
+/// real one elsewhere). Returns the repository's top-level directory
+/// (normalized, see [`normalize_path`]), or `None` if `dir` isn't inside one.
+pub fn find_git_root(dir: &Path) -> Option<String> {
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        if d.join(".git").exists() {
+            return Some(normalize_path(d));
+        }
+        current = d.parent();
+    }
+    None
+}
+
+/// Normalizes a path to one comparable string. The same directory can
+/// arrive spelled two different but equally valid ways -- e.g. MSYS2 bash
+/// rewrites `$(pwd)` to a forward-slash Windows path (`C:/Users/...`)
+/// before calling a native `.exe`, while `env::current_dir()` returns the
+/// backslash form -- so without this, the same project could fail to
+/// match itself. On Windows (case-insensitive, `/` and `\` both work),
+/// this lowercases and switches to `/`; elsewhere, paths are already
+/// case-sensitive and `/`-only, so it's left as-is.
+fn normalize_path(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        text.to_ascii_lowercase().replace('\\', "/")
+    } else {
+        text
     }
 }
 
@@ -268,5 +373,158 @@ mod tests {
         assert_eq!(exit_code, 0);
         assert_eq!(duration_ms, 42);
         assert_eq!(outcome, "WARN");
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("execguard-test-dir-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn find_git_root_detects_a_repo_from_inside_and_below_it() {
+        let repo = temp_dir("repo");
+        let nested = repo.join("src").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        assert_eq!(find_git_root(&repo), Some(normalize_path(&repo)));
+        assert_eq!(find_git_root(&nested), Some(normalize_path(&repo)));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn find_git_root_recognises_a_worktree_gitfile_too() {
+        // In a submodule/worktree, `.git` is a FILE pointing elsewhere,
+        // not a directory. Either one should count.
+        let repo = temp_dir("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(".git"), "gitdir: ../somewhere/else").unwrap();
+
+        assert_eq!(find_git_root(&repo), Some(normalize_path(&repo)));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn find_git_root_matches_regardless_of_slash_style() {
+        // The exact mismatch a real MSYS2-bash vs. native-Windows path
+        // would hit: two different spellings of the same directory.
+        let repo = temp_dir("slash-style");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let forward_slashed = repo.to_string_lossy().replace('\\', "/");
+        assert_eq!(find_git_root(&repo), find_git_root(Path::new(&forward_slashed)));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn find_git_root_is_none_outside_any_repo() {
+        let outside = temp_dir("not-a-repo");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert_eq!(find_git_root(&outside), None);
+
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn recording_inside_a_repo_stores_its_root() {
+        let repo = temp_dir("record-repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.to_string_lossy().into_owned();
+
+        let path = temp_db("record-project-root");
+        let store = Store::open(&path).unwrap();
+        store
+            .record(NewExecution { command: "ls", cwd: &cwd, shell: "bash", exit_code: 0, duration_ms: 1, outcome: "ALLOW" })
+            .unwrap();
+
+        let stored: Option<String> =
+            store.conn.query_row("SELECT project_root FROM executions", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, Some(normalize_path(&repo)));
+
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn recording_outside_a_repo_stores_no_project_root() {
+        let path = temp_db("record-no-project-root");
+        let store = Store::open(&path).unwrap();
+        store.record(execution("ls")).unwrap(); // "/home/ada/project" has no real .git here
+
+        let stored: Option<String> =
+            store.conn.query_row("SELECT project_root FROM executions", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[test]
+    fn query_with_no_filters_returns_everything_newest_first() {
+        let path = temp_db("query-all");
+        let store = Store::open(&path).unwrap();
+        store.record(execution("rm -rf build")).unwrap();
+        store.record(execution("git push --force")).unwrap();
+
+        let entries = store.query(Query { term: None, project_root: None, limit: 10 }).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].command, "git push --force"); // most recent first
+        assert_eq!(entries[1].command, "rm -rf build");
+    }
+
+    #[test]
+    fn query_term_filters_by_substring() {
+        let path = temp_db("query-term");
+        let store = Store::open(&path).unwrap();
+        store.record(execution("rm -rf build")).unwrap();
+        store.record(execution("git push --force")).unwrap();
+
+        let entries = store.query(Query { term: Some("push"), project_root: None, limit: 10 }).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "git push --force");
+    }
+
+    #[test]
+    fn query_limit_caps_the_results() {
+        let path = temp_db("query-limit");
+        let store = Store::open(&path).unwrap();
+        for i in 0..5 {
+            store.record(execution(&format!("echo {i}"))).unwrap();
+        }
+
+        let entries = store.query(Query { term: None, project_root: None, limit: 2 }).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn query_project_root_filters_to_that_project_only() {
+        let repo = temp_dir("query-project");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let cwd = repo.to_string_lossy().into_owned();
+
+        let path = temp_db("query-project-db");
+        let store = Store::open(&path).unwrap();
+        store.record(execution("rm -rf build")).unwrap(); // no project
+        store
+            .record(NewExecution {
+                command: "git push --force",
+                cwd: &cwd,
+                shell: "bash",
+                exit_code: 0,
+                duration_ms: 1,
+                outcome: "CONFIRM",
+            })
+            .unwrap();
+
+        // The query filter goes through the same normalization as what
+        // gets stored, the way the CLI's `--here` resolves it.
+        let normalized = find_git_root(&repo).unwrap();
+        let entries = store.query(Query { term: None, project_root: Some(&normalized), limit: 10 }).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "git push --force");
+
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 }
